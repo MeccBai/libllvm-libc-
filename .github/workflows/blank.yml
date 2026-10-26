@@ -24,7 +24,7 @@ jobs:
           git clone --depth 1 --filter=blob:none --sparse \
             --branch llvmorg-23.1.4 \
             https://github.com/llvm/llvm-project.git llvm-project
-          git -C llvm-project sparse-checkout set llvm
+          git -C llvm-project sparse-checkout set llvm cmake third-party
 
       - name: Configure
         run: |
