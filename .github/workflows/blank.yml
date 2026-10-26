@@ -1,0 +1,76 @@
+name: Build LLVM 23 with libc++
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang lld cmake ninja-build \
+            libc++-dev libc++abi-dev
+
+      - name: Fetch LLVM 23.1.4
+        run: |
+          git clone --depth 1 --filter=blob:none --sparse \
+            --branch llvmorg-23.1.4 \
+            https://github.com/llvm/llvm-project.git llvm-project
+          git -C llvm-project sparse-checkout set llvm
+
+      - name: Configure
+        run: |
+          cmake -S llvm-project/llvm -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
+            -DLLVM_ENABLE_LIBCXX=ON \
+            -DLLVM_USE_LINKER=lld \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLLVM_TARGETS_TO_BUILD='X86;NVPTX'
+
+      - name: Build libLLVM
+        run: cmake --build build --target LLVM --parallel "$(nproc)"
+
+      - name: Verify C++ runtime
+        run: |
+          so="$(find build/lib -maxdepth 1 -type f -name 'libLLVM*.so*' -print -quit)"
+          test -n "$so"
+          echo "Checking: $so"
+          readelf -d "$so" | tee needed.txt
+          grep -q 'libc++\.so' needed.txt
+          if grep -q 'libstdc++\.so' needed.txt; then
+            echo 'Unexpected libstdc++ dependency' >&2
+            exit 1
+          fi
+
+      - name: Package shared library and symlinks
+        run: |
+          mkdir -p dist
+          (
+            cd build/lib
+            tar -czf ../../dist/libLLVM-23.1.4-libcxx-linux-x86_64.tar.gz \
+              libLLVM*.so*
+          )
+          sha256sum dist/*.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libLLVM-23.1.4-libcxx-linux-x86_64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
