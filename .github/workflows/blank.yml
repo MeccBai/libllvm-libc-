@@ -2,6 +2,12 @@ name: Build LLVM 23 with libc++
 
 on:
   workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'llvm/llvm-project branch or tag (release/23.x or llvmorg-23.1.4)'
+        required: true
+        default: 'release/23.x'
+        type: string
 
 permissions:
   contents: read
@@ -10,6 +16,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    env:
+      LLVM_REF: ${{ inputs.source_ref }}
 
     steps:
       - name: Install build dependencies
@@ -19,14 +27,24 @@ jobs:
             clang lld cmake ninja-build \
             libc++-dev libc++abi-dev
 
-      - name: Fetch LLVM 23.1.4
+      - name: Fetch LLVM sources (sparse checkout)
+        shell: bash
         run: |
+          set -euo pipefail
           git clone --depth 1 --filter=blob:none --sparse \
-            --branch llvmorg-23.1.4 \
+            --branch "$LLVM_REF" \
             https://github.com/llvm/llvm-project.git llvm-project
-          git -C llvm-project sparse-checkout set llvm cmake third-party
+          # LLVM 23 needs ../cmake, third-party, and libc common utilities,
+          # even when LLVM_ENABLE_PROJECTS and LLVM_ENABLE_RUNTIMES are empty.
+          git -C llvm-project sparse-checkout set llvm cmake third-party libc
+          test -f llvm-project/cmake/Modules/CMakePolicy.cmake
+          test -f llvm-project/cmake/Modules/LLVMVersion.cmake
+          test -d llvm-project/third-party
+          test -f llvm-project/libc/CMakeLists.txt
+          test -f llvm-project/cmake/Modules/FindLibcCommonUtils.cmake
+          git -C llvm-project rev-parse HEAD | tee llvm-commit.txt
 
-      - name: Configure
+      - name: Configure LLVM
         run: |
           cmake -S llvm-project/llvm -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
@@ -39,38 +57,47 @@ jobs:
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_PARALLEL_COMPILE_JOBS=3 \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_TARGETS_TO_BUILD='X86;NVPTX'
 
       - name: Build libLLVM
-        run: cmake --build build --target LLVM --parallel "$(nproc)"
+        run: cmake --build build --target LLVM --parallel 3
 
-      - name: Verify C++ runtime
+      - name: Verify C++ runtime linkage
+        shell: bash
         run: |
+          set -euo pipefail
           so="$(find build/lib -maxdepth 1 -type f -name 'libLLVM*.so*' -print -quit)"
           test -n "$so"
           echo "Checking: $so"
           readelf -d "$so" | tee needed.txt
-          grep -q 'libc++\.so' needed.txt
+          if ! grep -q 'libc++\.so' needed.txt; then
+            echo 'Missing libc++ dependency: check the LLVM_ENABLE_LIBCXX configuration' >&2
+            exit 1
+          fi
           if grep -q 'libstdc++\.so' needed.txt; then
-            echo 'Unexpected libstdc++ dependency' >&2
+            echo 'Unexpected direct libstdc++ dependency' >&2
             exit 1
           fi
 
-      - name: Package shared library and symlinks
+      - name: Package libLLVM and metadata
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           (
             cd build/lib
-            tar -czf ../../dist/libLLVM-23.1.4-libcxx-linux-x86_64.tar.gz \
+            tar -czf ../../dist/libLLVM-23-libcxx-linux-x86_64.tar.gz \
               libLLVM*.so*
           )
-          sha256sum dist/*.tar.gz
+          cp llvm-commit.txt needed.txt dist/
+          sha256sum dist/*.tar.gz | tee dist/SHA256SUMS
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: libLLVM-23.1.4-libcxx-linux-x86_64
-          path: dist/*.tar.gz
+          name: libLLVM-23-libcxx-linux-x86_64
+          path: dist/
           if-no-files-found: error
           retention-days: 30
